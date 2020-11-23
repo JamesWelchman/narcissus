@@ -1,0 +1,17 @@
+[package]
+name = "narcissus"
+version = "0.1.0"
+authors = ["James Welchman <james.welchman@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.59"
+libc = "0.2.80"
+ctrlc = "3.1.7"
+rscam = "0.5.5"
+
+[build-dependencies]
+cc = "1.0"

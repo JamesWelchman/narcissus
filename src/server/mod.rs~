@@ -1,0 +1,439 @@
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
+use std::thread::{Builder, JoinHandle, sleep};
+use std::os::unix::net::{UnixStream, UnixListener};
+use std::path::Path;
+use std::fs::{remove_file, OpenOptions};
+use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::fmt;
+use std::time::{Duration, SystemTime};
+
+use crate::errors::*;
+use crate::narcissus::{Narcissus, Config};
+use crate::exchange::Exchange;
+
+use crate::{info, error, tags};
+
+use serde::{Serialize, Deserialize};
+use serde_json;
+
+const VERSION: u8 = 0;
+
+pub struct Server {
+	pub handle: JoinHandle<()>,
+	close_chans: Arc<Mutex<HashMap<String, Sender<()>>>>,
+}
+
+// log session_id/msg_id and msg_seq_num
+impl Server {
+	pub fn new(n: Arc<Narcissus>, exc: Exchange) -> Result<Self> {
+		let path = Path::new(&n.config.socket_path);
+		if path.exists() {
+			remove_file(&path)?;
+		}
+
+		// Create the Unix socket file
+		info!("creating unix socket", tags![
+			("path", &n.config.socket_path)
+		]);
+		let listener = UnixListener::bind(path)?;
+
+		let close_chans = Arc::new(Mutex::new(HashMap::new()));
+		let c = close_chans.clone();
+
+		// Start the server thread
+		let handle = Builder::new()
+			.name("server".to_string())
+			.spawn(move || {
+				info!("server started");
+				server_loop(n, c, listener);
+			})?;
+
+		Ok(Self{
+			handle: handle,
+			close_chans: close_chans,
+		})
+	}
+}
+
+impl Drop for Server {
+	fn drop(&mut self) {
+		// Send close to all the clients
+		{
+			let close_chans = self.close_chans.lock()
+				.expect("couldn't lock close_chans");
+			for (name, sx) in close_chans.iter() {
+				if let Err(e) = sx.send(()) {
+					error!("couldn't sent shutdown", tags![
+						("name", &name)
+					]);
+				}
+			}
+		} // Free the close_chans mutex
+
+		// Wait for all the client threads to close
+		loop {
+			{
+				let mut close_chans = self.close_chans.lock()
+					.expect("couldn't lock close_chans");
+
+				if close_chans.len() == 0 {
+					break;
+				}
+			} // Free the Mutex
+
+			sleep(Duration::from_millis(400));
+		}
+	}
+}
+
+fn server_loop(n: Arc<Narcissus>,
+			   close_chans: Arc<Mutex<HashMap<String, Sender<()>>>>,
+			   mut listener: UnixListener) {
+	let mut thread_num = 0;
+
+	for stream in listener.incoming() {
+		match stream {
+			Ok(stream) => {
+				let (sx, rx) = channel();
+				let name = format!("client_{}", thread_num);
+				let n = n.clone();
+				let c = close_chans.clone();
+				let name2 = name.clone();
+				Builder::new()
+					.name(name.clone())
+					.spawn(move || {
+						client_loop(n, rx, stream);
+						let mut close_chans = c.lock()
+							.expect("couldn't access close_chans");
+						close_chans.remove(&name2);
+						info!("thread closing");
+					})
+					.expect("couldn't start client thread");
+				thread_num += 1;
+				let mut close_chans = close_chans.lock()
+					.expect("couldn't access close_chans");
+				close_chans.insert(name, sx);
+			},
+			Err(e) => {
+				error!("problem with stream", tags![
+					("error", &e.to_string())
+				]);
+			}
+		}
+	}
+}
+
+fn client_loop(n: Arc<Narcissus>,
+	           closer: Receiver<()>,
+	           stream: UnixStream) {
+	if let Err(e) = client_loop_run(n, closer, stream) {
+		error!("client thread crashed", tags![
+			("error", &e.to_string())
+		]);
+	}
+}
+
+fn client_loop_run(n: Arc<Narcissus>,
+				   closer: Receiver<()>,
+				   mut stream: UnixStream)
+	-> Result<()> {
+	// The client should send us client-hello
+	// First read the ten byte header.
+	let mut header_buf = [0 as u8; 10];
+	let mut response_buf: Vec<u8> = Vec::with_capacity(4096);
+	let mut msg_id: u32 = 0;
+	let mut id_gen = MsgId::new()?;
+
+	stream.read_exact(&mut header_buf)?;
+
+	// Parse the header
+	let header = Header::from_raw(&header_buf)?;
+	if header.msg_type != MsgType::Hello {
+		// This is garbage - get rid
+	}
+
+	let session_id = id_gen.new_session_id()?;
+
+	// Send the response - we send back the config
+	// and a session id.
+	build_response(&mut response_buf,
+ 			       MsgType::Hello,
+ 			       id_gen.new_msg_id()?,
+				   &HelloResponse{
+		    	       config: n.config.clone(),
+			           session_id: session_id.clone(),
+				  })?;
+	// Send the response to the client
+	stream.write_all(&response_buf)?;
+
+	info!("started client session", tags![
+		("session_id", &session_id),
+		("msg_id", &format!("{}", header.msg_id))
+	]);
+
+	// Okay enter the main loop.
+	// We have two operations - reading new client
+	// subscriptions and streaming our current subscriptions.
+	stream.set_nonblocking(true)
+		.expect("couldn't set socket to non blocking");
+
+	// Our registers are all about reads
+	let mut read_state = 0;
+	let mut header_buf_len = 0;
+	let mut request_buf_len = 0;
+	let mut header: Option<Header> = None;
+	let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
+	let mut last_heartbeat_time = SystemTime::now();
+	response_buf.clear();
+	header_buf.iter_mut().for_each(|w| *w = 0);
+	loop {
+		// Check if we have received the close event
+		match closer.try_recv() {
+			Ok(_) => {
+				info!("received shutdown", tags![
+					("session_id", &session_id)
+				]);
+				break;
+			},
+			Err(e) if e == TryRecvError::Empty => {},
+			Err(e) => {
+				return Err(Box::new(e));
+			}
+		};
+		// If we haven't received a heartbeat for 15 seconds
+		// we assume the client has gone away and we close.
+		if last_heartbeat_time.elapsed()? > Duration::new(15, 0) {
+			info!("client stopped heartbeating closing", tags![
+				("session_id", &session_id)
+			]);
+			return Ok(());
+		}
+		match read_state {
+			0 => {
+				// Attempt to read the header
+				let buf = &mut header_buf[header_buf_len..];
+				header_buf_len += match stream.read(buf) {
+					Err(ref e) if e.raw_os_error() == Some(11)  => 0,
+					Err(e) => {
+						error!("couldn't read msg from sock", tags![
+							("error", &e.to_string())
+						]);
+						return Err(Box::new(e));
+					},
+					Ok(n) => n,
+				};
+				if header_buf_len == 10 {
+					header = Some(Header::from_raw(&header_buf)?);
+					header_buf_len = 0;
+					read_state = 1;
+					request_buf.resize(header.unwrap()
+						.msg_len as usize, 0);
+
+					info!("processing message", tags![
+						("session_id", &session_id),
+						("msg_type", &header.unwrap()
+										.msg_type.to_string())
+					]);
+
+					// If the client requested a shutdown
+					// then we break and execute the shutdown
+					// logic below.
+					if header.unwrap().msg_type == MsgType::Shutdown {
+						info!("client sent shutdown", tags![
+							("session_id", &session_id)
+						]);
+						break;
+					}
+				}
+			},
+			1 => {
+				// We have a header - read the body
+				let buf = &mut request_buf[request_buf_len..];
+				request_buf_len += match stream.read(buf) {
+					Err(ref e) if e.raw_os_error() == Some(11) => 0,
+					Err(e) => {
+						error!("couldn't read msg from sock", tags![
+							("error", &e.to_string())
+						]);
+						return Err(Box::new(e));
+					},
+					Ok(n) => n,
+				};
+				if request_buf_len == header.unwrap().msg_len as usize {
+					// Parse the body
+					request_buf_len = 0;
+					request_buf.clear();
+					read_state = 0;
+
+					// Handle heartbeat
+					if let Some(header) = header {
+						if header.msg_type == MsgType::heartbeat {
+							last_heartbeat_time = SystemTime::now();
+						}
+
+						if header.msg_type == MsgType::faceposition {
+							info!("streaming faceposition", tags![
+								("session_id", &session_id)
+							]);
+						}
+					}
+				}
+
+			},
+			_ => {
+			}
+		}
+
+		// Here we handle the writes
+		// We attempt to read from our recv channel
+	}
+
+	// Send a shutdown
+	response_buf.clear();
+	build_response(&mut response_buf,
+		           MsgType::Shutdown,
+		           id_gen.new_msg_id()?,
+		           &Empty{})?;
+
+	// Write it
+	stream.write_all(&response_buf)?;
+	Ok(())
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum MsgType {
+	Hello,
+	Shutdown,
+	heartbeat,
+	faceposition,
+}
+
+impl fmt::Display for MsgType {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", match self {
+			Hello => "hello",
+			Shutdown => "Shutdown",
+			heartbeat => "heartbeat",
+			faceposition => "faceposition",
+		})?;
+		Ok(())
+	}
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Header {
+	version: u8,
+	msg_type: MsgType,
+	msg_len: u32,
+	msg_id: u32,
+}
+
+impl Header {
+	fn from_raw(raw: &[u8; 10]) -> Result<Self> {
+		// The first byte must be the version
+		if raw[0] != VERSION {
+			return Err(Box::new(Error{
+				error_type: ErrorType::invalid_request,
+			}));
+		}
+
+		// Okay read the msg_type
+		let msg_type = match raw[1] {
+			b'A' => Ok(MsgType::Hello),
+			b'Z' => Ok(MsgType::Shutdown),
+			b'H' => Ok(MsgType::heartbeat),
+			b'P' => Ok(MsgType::faceposition),
+			_ => {
+				Err(Box::new(Error{
+					error_type: ErrorType::invalid_request,
+				}))
+			},
+		}?;
+
+		// Parse the msg_len - u32 little endian
+		let msg_len_buf = [raw[2], raw[3], raw[4], raw[5]];
+		let msg_len = u32::from_le_bytes(msg_len_buf);
+
+		let msg_id_buf = [raw[6], raw[7], raw[8], raw[9]];
+		let msg_id = u32::from_le_bytes(msg_id_buf);
+
+		Ok(Self{
+			version: VERSION,
+			msg_type: msg_type,
+			msg_len: msg_len,
+			msg_id: msg_id,
+		})
+	}
+}
+
+fn build_response<B: Serialize>(buf: &mut Vec<u8>,
+				  msg_type: MsgType,
+				  msg_id: u32,
+				  body: &B) -> Result<()>
+{
+	// Write a complete response to the buffer
+	buf.push(VERSION);
+	buf.push(match msg_type {
+		MsgType::Hello => b'a',
+		MsgType::Shutdown => b'z',
+		MsgType::heartbeat => b'h',
+		MsgType::faceposition => b'p',
+	});
+
+	// Serialize the body
+	let body = serde_json::to_string(&body)?;
+	let len = body.len() as u32;
+
+	buf.extend_from_slice(&len.to_le_bytes());
+	buf.extend_from_slice(&msg_id.to_le_bytes());
+	buf.extend_from_slice(body.as_bytes());
+	Ok(())
+}
+
+// Message types
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HelloResponse {
+	config: Config,
+
+	session_id: String,
+
+	// TODO: webcam details
+}
+
+#[derive(Serialize)]
+struct Empty{}
+
+struct MsgId {
+	file: std::fs::File,
+	buf: [u8; 4],
+}
+
+impl MsgId {
+	fn new() -> Result<Self> {
+		Ok(Self{
+			file: OpenOptions::new()
+				   .read(true)
+				   .open("/dev/random")?,
+			buf: [0; 4],
+		})
+	}
+
+	fn new_msg_id(&mut self) -> Result<u32> {
+		self.next()?;
+		Ok(u32::from_le_bytes(self.buf))
+	}
+
+	fn new_session_id(&mut self) -> Result<String> {
+		self.next()?;
+		let id = u32::from_le_bytes(self.buf);
+		Ok(format!("{:08x}", id))
+	}
+
+	fn next(&mut self) -> Result<()> {
+		self.file.read_exact(&mut self.buf)?;
+		Ok(())
+	}
+}
