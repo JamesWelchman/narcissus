@@ -2,6 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{Builder, sleep};
 use std::time::Duration;
 
+extern crate rustface;
+use rustface::ImageData;
+
 use crate::errors::*;
 use crate::videoq;
 use crate::narcissus::Narcissus;
@@ -25,12 +28,6 @@ pub struct Exchange{
 
 	luminosity_senders: 
 		Arc<Mutex<Vec<confchannel::Sender<msgs::Luminosity>>>>,
-}
-
-#[link(name="normalize_integral_image")]
-extern {
-	fn normalize_integral_image(src: *const u8, dst: *mut f32)
-		-> libc::c_int;
 }
 
 impl Exchange {
@@ -95,54 +92,23 @@ fn faceposition(n: Arc<Narcissus>,
 				receiver: videoq::Receiver,
 				faceposition_senders: Arc<Mutex<Vec<Sender<FacePosition>>>>) {
 	let mut faceposition = FacePosition::default();
-	let mut no_subscribers = true;
 	let mut to_delete = vec![];
-	let num_lumin_bytes = (
-		n.config.webcam_resolution.0 * n.config.webcam_resolution.1
-	) as usize;
+	let mut no_subscribers = true;
+	let (width, height) = (
+		n.config.webcam_resolution.0, n.config.webcam_resolution.1
+	);
+	let num_lumin_bytes = (width * height) as usize;
+	let mut old_timestamp: u64 = 0;
 
-	if num_lumin_bytes % 4 != 0 {
-		panic!("assumption num_pixels mod 4 is false");
-	}
-	let mut integral_image = vec![0.0; num_lumin_bytes / 4];
+	// Face detection
+	let mut grayscale = vec![0 as u8; num_lumin_bytes];
+	let mut detector = rustface::create_detector("seeta_fd_frontal_v1.0.bin")
+		.expect("couldn't read face detection model");
 
 	loop {
-		// Park the thread for a second if there is nothing
-		// to do.
 		if no_subscribers {
 			sleep(Duration::new(1, 0));
 		}
-
-		{
-
-			// Grab a video frame
-			let (frame, timestamp) = match receiver.recv() {
-				Ok((frame, timestamp)) => (frame, timestamp),
-				Err(_) => {
-					// TODO: log
-					break;
-				},
-			};
-
-			if timestamp == faceposition.timestamp {
-				// Already processed
-				sleep(Duration::from_millis(20));
-				continue;
-			}
-
-			faceposition.timestamp = timestamp;
-
-			unsafe {
-				normalize_integral_image(frame.as_ptr(),
-					                     integral_image.as_mut_ptr());
-			}
-		// Drop the frame
-		}
-		// Simulate actually computing faceposition
-		faceposition.bottom_left[0] += 1;
-		faceposition.bottom_left[1] += 1;
-		faceposition.top_right[0] += 1;
-		faceposition.top_right[1] += 1;
 
 		// Write to our senders
 		{
@@ -170,6 +136,63 @@ fn faceposition(n: Arc<Narcissus>,
 			}
 		// Unlock the mutex around our subscribers vector
 		}
+
+		{
+
+			// Grab a video frame
+			let (frame, timestamp) = match receiver.recv() {
+				Ok((frame, timestamp)) => (frame, timestamp),
+				Err(_) => {
+					// TODO: log
+					break;
+				},
+			};
+
+			if timestamp == faceposition.timestamp {
+				// Already processed
+				sleep(Duration::from_millis(20));
+			}
+
+			old_timestamp = faceposition.timestamp;
+			faceposition.timestamp = timestamp;
+
+			// Copy the lumin bytes
+			frame.iter().step_by(2)
+				.zip(grayscale.iter_mut())
+				.for_each(|(&p, q)| *q = p);
+
+		// Drop the frame
+		}
+
+		let mut image = ImageData::new(&grayscale, width, height);
+		let mut size = 0;
+		let mut found = false;
+		for face in detector.detect(&mut image).into_iter() {
+			found = true;
+			// Use the biggest face
+			let bbox = face.bbox();
+			if (bbox.height() * bbox.width()) > size {
+				faceposition.bottom_left = [
+					if bbox.x() > 0 {bbox.x() as u32} else {0},
+					if bbox.y() > 0 {bbox.y() as u32} else {0},
+				];
+
+				faceposition.top_right = [
+					if bbox.x() > 0 {bbox.x() as u32} else {0}
+					+ bbox.width(),
+					if bbox.y() > 0 {bbox.y() as u32} else {0}
+					+ bbox.height(),
+				];
+				size = bbox.height() * bbox.width();
+			}
+		}
+
+		if !found {
+			// If we don't find any faces then use
+			// the old timestamp
+			faceposition.timestamp = old_timestamp;
+		}
+
 	}
 }
 
